@@ -1,0 +1,93 @@
+name: Build HMAKernelObject
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  MODULE_NAME: hma_ko
+  MODULE_SRC: hma_ko.c
+  OUT_DIR: out
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - gki_name: android12-5.10
+            manifest_ref: android12-5.10
+          - gki_name: android13-5.10
+            manifest_ref: android13-5.10
+          - gki_name: android13-5.15
+            manifest_ref: android13-5.15
+          - gki_name: android14-5.15
+            manifest_ref: android14-5.15
+          - gki_name: android14-6.1
+            manifest_ref: android14-6.1
+          - gki_name: android15-6.6
+            manifest_ref: android15-6.6
+          - gki_name: android16-6.12
+            manifest_ref: android16-6.12
+          - arch: x86_64
+          - arch: x86
+          - arch: arm
+          - arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl wget build-essential bison flex bc libncurses-dev
+          curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Prepare kernel source
+        if: matrix.manifest_ref != null
+        env:
+          MANIFEST_REF: ${{ matrix.manifest_ref }}
+        run: |
+          KERNEL_WS=$GITHUB_WORKSPACE/kernel-${{ matrix.gki_name }}
+          mkdir -p "$KERNEL_WS"
+          cd "$KERNEL_WS"
+          repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_REF"
+          repo sync -j4 --no-tags --no-clone-bundle
+          echo "$KERNEL_WS" > $GITHUB_WORKSPACE/.kdir_path
+
+      - name: Build module (per-arch)
+        if: matrix.arch != null
+        env:
+          ARCH: ${{ matrix.arch }}
+          OUTDIR: ${{ github.workspace }}/out/${{ matrix.gki_name || 'default' }}/${{ matrix.arch }}
+        run: |
+          set -e
+          KDIR_FILE="$GITHUB_WORKSPACE/.kdir_path"
+          if [ ! -f "$KDIR_FILE" ]; then
+            echo "No kernel workspace found for this matrix row; aborting."
+            exit 1
+          fi
+          KDIR=$(cat "$KDIR_FILE")
+          mkdir -p "$OUTDIR"
+          case "$ARCH" in
+            x86_64) CROSS_PREFIX= ;;
+            x86) CROSS_PREFIX=i686-linux-gnu- ;;
+            arm) CROSS_PREFIX=arm-linux-gnueabihf- ;;
+            arm64) CROSS_PREFIX=aarch64-linux-gnu- ;;
+            *) echo "Unknown arch $ARCH"; exit 1 ;;
+          esac
+          make -C "$KDIR" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} modules_prepare -j$(nproc)
+          make -C "$KDIR" M="$GITHUB_WORKSPACE" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} modules -j$(nproc)
+          if [ -f "$GITHUB_WORKSPACE/${MODULE_NAME}.ko" ]; then
+            cp "$GITHUB_WORKSPACE/${MODULE_NAME}.ko" "$OUTDIR/${MODULE_NAME}-${ARCH}.ko"
+          else
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name "${MODULE_NAME}*.ko" -exec cp {} "$OUTDIR/" \; || true
+          fi
+          make -C "$KDIR" M="$GITHUB_WORKSPACE" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} clean || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmako-${{ matrix.gki_name || 'default' }}-${{ matrix.arch || 'all' }}
+          path: out/**

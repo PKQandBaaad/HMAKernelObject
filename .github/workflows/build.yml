@@ -11,7 +11,7 @@ env:
   OUT_DIR: out
 
 jobs:
-  build:
+  build-gki:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -30,10 +30,7 @@ jobs:
             manifest_ref: android15-6.6
           - gki_name: android16-6.12
             manifest_ref: android16-6.12
-          - arch: x86_64
-          - arch: x86
-          - arch: arm
-          - arch: arm64
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,50 +41,83 @@ jobs:
           curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
 
-      - name: Prepare kernel source
-        if: matrix.manifest_ref != null
+      - name: Android kernel
         env:
           MANIFEST_REF: ${{ matrix.manifest_ref }}
+          KERNEL_WS: ${{ github.workspace }}/kernel-${{ matrix.gki_name }}
+          OUTROOT: ${{ github.workspace }}/out/${{ matrix.gki_name }}
+          X86_64_CROSS: ""
+          X86_CROSS: "i686-linux-gnu-"
+          ARM_CROSS: "arm-linux-gnueabihf-"
+          ARM64_CROSS: "aarch64-linux-gnu-"
         run: |
-          KERNEL_WS=$GITHUB_WORKSPACE/kernel-${{ matrix.gki_name }}
-          mkdir -p "$KERNEL_WS"
-          cd "$KERNEL_WS"
-          repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_REF"
+          set -euo pipefail
+          mkdir -p "${KERNEL_WS}"
+          cd "${KERNEL_WS}"
+          repo init -u https://android.googlesource.com/kernel/manifest -b "${MANIFEST_REF}"
           repo sync -j4 --no-tags --no-clone-bundle
-          echo "$KERNEL_WS" > $GITHUB_WORKSPACE/.kdir_path
 
-      - name: Build module (per-arch)
-        if: matrix.arch != null
-        env:
-          ARCH: ${{ matrix.arch }}
-          OUTDIR: ${{ github.workspace }}/out/${{ matrix.gki_name || 'default' }}/${{ matrix.arch }}
-        run: |
-          set -e
-          KDIR_FILE="$GITHUB_WORKSPACE/.kdir_path"
-          if [ ! -f "$KDIR_FILE" ]; then
-            echo "No kernel workspace found for this matrix row; aborting."
-            exit 1
-          fi
-          KDIR=$(cat "$KDIR_FILE")
-          mkdir -p "$OUTDIR"
-          case "$ARCH" in
-            x86_64) CROSS_PREFIX= ;;
-            x86) CROSS_PREFIX=i686-linux-gnu- ;;
-            arm) CROSS_PREFIX=arm-linux-gnueabihf- ;;
-            arm64) CROSS_PREFIX=aarch64-linux-gnu- ;;
-            *) echo "Unknown arch $ARCH"; exit 1 ;;
-          esac
-          make -C "$KDIR" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} modules_prepare -j$(nproc)
-          make -C "$KDIR" M="$GITHUB_WORKSPACE" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} modules -j$(nproc)
-          if [ -f "$GITHUB_WORKSPACE/${MODULE_NAME}.ko" ]; then
-            cp "$GITHUB_WORKSPACE/${MODULE_NAME}.ko" "$OUTDIR/${MODULE_NAME}-${ARCH}.ko"
-          else
-            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name "${MODULE_NAME}*.ko" -exec cp {} "$OUTDIR/" \; || true
-          fi
-          make -C "$KDIR" M="$GITHUB_WORKSPACE" ARCH=${ARCH} CROSS_COMPILE=${CROSS_PREFIX} clean || true
+          mkdir -p "${OUTROOT}"
+          cd "${KERNEL_WS}"
+
+          MOD_SRC="${{ github.workspace }}"
+          ARCHS="x86_64 x86 arm arm64"
+
+          build_one() {
+            ARCH=$1
+            CROSS=$2
+            BUILD_DIR="${KERNEL_WS}"
+            OUTDIR="${OUTROOT}/${ARCH}"
+            mkdir -p "${OUTDIR}"
+            echo "BUILD-START ${matrix.gki_name} ${ARCH}"
+            make -C "${BUILD_DIR}" ARCH=${ARCH} CROSS_COMPILE=${CROSS} modules_prepare -j$(nproc) || return 2
+            make -C "${BUILD_DIR}" M="${MOD_SRC}" ARCH=${ARCH} CROSS_COMPILE=${CROSS} modules -j$(nproc) || return 3
+            if [ -f "${MOD_SRC}/${MODULE_NAME}.ko" ]; then
+              cp "${MOD_SRC}/${MODULE_NAME}.ko" "${OUTDIR}/${MODULE_NAME}-${ARCH}.ko"
+            else
+              find "${MOD_SRC}" -maxdepth 1 -type f -name "${MODULE_NAME}*.ko" -exec cp {} "${OUTDIR}/" \; || true
+            fi
+            make -C "${BUILD_DIR}" M="${MOD_SRC}" ARCH=${ARCH} CROSS_COMPILE=${CROSS} clean || true
+            echo "BUILD-SUCCESS ${matrix.gki_name} ${ARCH}"
+            return 0
+          }
+
+          declare -A pids
+          declare -A arch_logs
+          for a in ${ARCHS}; do
+            case "${a}" in
+              x86_64) cross="${X86_64_CROSS}" ;;
+              x86)    cross="${X86_CROSS}" ;;
+              arm)    cross="${ARM_CROSS}" ;;
+              arm64)  cross="${ARM64_CROSS}" ;;
+            esac
+            log="${OUTROOT}/${a}.log"
+            arch_logs[${a}]="${log}"
+            (
+              build_one "${a}" "${cross}"
+            ) >"${log}" 2>&1 &
+            pids[${a}]=$!
+            echo "Started ${a} pid=${pids[${a}]}"
+          done
+
+          declare -A exitcodes
+          for a in ${ARCHS}; do
+            pid=${pids[${a}]}
+            wait "${pid}" || true
+            rc=$?
+            exitcodes[${a}]=$rc
+            echo "Arch ${a} finished with exit code ${rc}"
+          done
+
+          echo "Build summary for ${matrix.gki_name}:" > "${OUTROOT}/summary.txt"
+          for a in ${ARCHS}; do
+            rc=${exitcodes[${a}]}
+            echo "${a}: ${rc}" >> "${OUTROOT}/summary.txt"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hmako-${{ matrix.gki_name || 'default' }}-${{ matrix.arch || 'all' }}
-          path: out/**
+          name: hmako-${{ matrix.gki_name }}
+          path: out/${{ matrix.gki_name }}/**
+
